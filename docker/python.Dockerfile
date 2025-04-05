@@ -2,7 +2,6 @@
 
 FROM alpine:3.21.3
 
-RUN apk update
-RUN apk add --no-cache python3 build-base py3-pip openjdk8 nano
+RUN apk add --no-cache python3 py3-pip
 
-CMD [ "python3", "-m", "http.server" ]
+CMD ["sleep", "infinity"]
