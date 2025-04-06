@@ -19,6 +19,7 @@ import (
 type Task struct {
 	Lang string `json:"lang"`
 	Code string `json:"code"`
+	ID   string `json:"id"`
 }
 
 func main() {
@@ -84,11 +85,11 @@ func processSubmission(ctx context.Context, redisClient *redis.Client, dockerCli
 
 		fmt.Printf("Processing task - Language: %s\nCode: %s\n", task.Lang, task.Code)
 
-		executeTaskInContainer(ctx, dockerClient, task, containerID)
+		executeTaskInContainer(ctx, dockerClient, task, redisClient, containerID)
 	}
 }
 
-func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, task Task, containerID string) {
+func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, task Task, redisClient *redis.Client, containerID string) {
 
 	err := dockerClient.ContainerStart(ctx, containerID, container.StartOptions{})
 	if err != nil {
@@ -121,10 +122,10 @@ func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, ta
 		log.Fatalf("Error starting container exec: %s", err)
 	}
 
-	readLogs(response)
+	readLogs(response, ctx, redisClient, task.ID)
 }
 
-func readLogs(response types.HijackedResponse) {
+func readLogs(response types.HijackedResponse, ctx context.Context, redisClient *redis.Client, submissionID string) {
 	output, err := io.ReadAll(response.Reader)
 	if err != nil {
 		log.Printf("Error reading output: %v", err)
@@ -133,6 +134,14 @@ func readLogs(response types.HijackedResponse) {
 	}
 
 	fmt.Println("Execution completed successfully!")
+
+	publishToRedis(ctx, redisClient, submissionID, string(output))
+}
+
+func publishToRedis(ctx context.Context, redisClient *redis.Client, submissionID string, output string) {
+	redisClient.Publish(ctx, submissionID, output)
+	fmt.Println(output)
+	fmt.Printf("Successfully published on %s\n", submissionID)
 }
 
 func server() {
