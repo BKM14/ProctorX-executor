@@ -8,10 +8,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
@@ -60,7 +62,7 @@ func initRedisClient() *redis.Client {
 }
 
 func processSubmission(ctx context.Context, redisClient *redis.Client, dockerClient *client.Client) {
-	containerID := "2f5200a742a2"
+	containerID := "9b8169c7a399"
 	for {
 		submission := redisClient.BRPop(ctx, 0, "submissions")
 		result, err := submission.Result()
@@ -83,13 +85,63 @@ func processSubmission(ctx context.Context, redisClient *redis.Client, dockerCli
 			return
 		}
 
+		filename := uuid.NewString() + "." + task.Lang
+		filename = strings.Replace(filename, "-", "_", -1)
+
+		if task.Lang == "java" {
+			filename = "Main_" + filename
+		}
+
+		file, err := os.Create("executions/" + filename)
+		if err != nil {
+			panic(err)
+		}
+
+		var finalCode string
+
+		if task.Lang == "java" {
+			finalCode = strings.Replace(task.Code, "public class Main", "public class "+strings.Split(filename, ".")[0], -1)
+		} else {
+			finalCode = task.Code
+		}
+
+		_, err = file.WriteString(finalCode)
+		if err != nil {
+			panic(err)
+		}
+
+		file.Close()
+
 		fmt.Printf("Processing task - Language: %s\nCode: %s\n", task.Lang, task.Code)
 
-		executeTaskInContainer(ctx, dockerClient, task, redisClient, containerID)
+		var command []string
+
+		switch task.Lang {
+		case "py":
+			command = []string{"python3", "/executions/" + filename}
+
+		case "java":
+			className := strings.Split(filename, ".")[0]
+			command = []string{"sh", "-c", "javac /executions/" + filename + " && java -cp /executions " + className}
+
+		case "cpp":
+			outFile := "/executions/" + strings.Split(filename, ".")[0]
+			command = []string{"sh", "-c", "g++ /executions/" + filename + " -o " + outFile + " && " + outFile}
+
+		case "c":
+			outFile := "/executions/" + strings.Split(filename, ".")[0]
+			command = []string{"sh", "-c", "gcc /executions/" + filename + " -o " + outFile + " && " + outFile}
+
+		default:
+			log.Printf("Unsupported language: %s", task.Lang)
+			return
+		}
+
+		executeTaskInContainer(ctx, dockerClient, command, redisClient, containerID, task, filename)
 	}
 }
 
-func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, task Task, redisClient *redis.Client, containerID string) {
+func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, command []string, redisClient *redis.Client, containerID string, task Task, filename string) {
 
 	err := dockerClient.ContainerStart(ctx, containerID, container.StartOptions{})
 	if err != nil {
@@ -98,7 +150,7 @@ func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, ta
 	}
 
 	exec, err := dockerClient.ContainerExecCreate(ctx, containerID, container.ExecOptions{
-		Cmd:          []string{"python3", "-c", task.Code},
+		Cmd:          command,
 		AttachStdout: true,
 		AttachStderr: true,
 	})
@@ -123,6 +175,13 @@ func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, ta
 	}
 
 	readLogs(response, ctx, redisClient, task.ID)
+
+	os.Remove("executions/" + filename)
+	if task.Lang == "java" {
+		os.Remove("executions/" + strings.Split(filename, ".")[0] + ".class")
+	} else if task.Lang == "cpp" || task.Lang == "c" {
+		os.Remove("executions/" + strings.Split(filename, ".")[0])
+	}
 }
 
 func readLogs(response types.HijackedResponse, ctx context.Context, redisClient *redis.Client, submissionID string) {
