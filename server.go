@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 
+	"bytes"
+
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
@@ -185,16 +187,25 @@ func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, co
 }
 
 func readLogs(response types.HijackedResponse, ctx context.Context, redisClient *redis.Client, submissionID string) {
-	output, err := io.ReadAll(response.Reader)
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	_, err := stdcopy.StdCopy(&stdoutBuf, &stderrBuf, response.Reader)
 	if err != nil {
-		log.Printf("Error reading output: %v", err)
-	} else {
-		fmt.Println(string(output))
+		log.Printf("Error copying output: %v", err)
 	}
 
+	stdout := stdoutBuf.String()
+	stderr := stderrBuf.String()
+
+	if stderr != "" {
+		log.Printf("Stderr: %s", stderr)
+	}
+
+	fmt.Printf("Stdout: %s\n", stdout)
 	fmt.Println("Execution completed successfully!")
 
-	publishToRedis(ctx, redisClient, submissionID, string(output))
+	publishToRedis(ctx, redisClient, submissionID, stdout)
 }
 
 func publishToRedis(ctx context.Context, redisClient *redis.Client, submissionID string, output string) {
