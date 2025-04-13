@@ -200,6 +200,8 @@ func readLogs(response types.HijackedResponse, ctx context.Context, redisClient 
 
 	if stderr != "" {
 		log.Printf("Stderr: %s", stderr)
+		publishToRedis(ctx, redisClient, submissionID, stderr)
+		return
 	}
 
 	fmt.Printf("Stdout: %s\n", stdout)
