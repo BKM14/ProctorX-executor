@@ -120,19 +120,19 @@ func processSubmission(ctx context.Context, redisClient *redis.Client, dockerCli
 
 		switch task.Lang {
 		case "py":
-			command = []string{"python3", "/executions/" + filename}
+			command = []string{"sh", "-c", fmt.Sprintf("timeout 5s python3 /executions/%s", filename)}
 
 		case "java":
 			className := strings.Split(filename, ".")[0]
-			command = []string{"sh", "-c", "javac /executions/" + filename + " && java -cp /executions " + className}
+			command = []string{"sh", "-c", fmt.Sprintf("javac /executions/%s && timeout 5s java -cp /executions %s", filename, className)}
 
 		case "cpp":
 			outFile := "/executions/" + strings.Split(filename, ".")[0]
-			command = []string{"sh", "-c", "g++ /executions/" + filename + " -o " + outFile + " && " + outFile}
+			command = []string{"sh", "-c", fmt.Sprintf("g++ /executions/%s -o %s && timeout 5s %s", filename, outFile, outFile)}
 
 		case "c":
 			outFile := "/executions/" + strings.Split(filename, ".")[0]
-			command = []string{"sh", "-c", "gcc /executions/" + filename + " -o " + outFile + " && " + outFile}
+			command = []string{"sh", "-c", fmt.Sprintf("gcc /executions/%s -o %s && timeout 5s %s", filename, outFile, outFile)}
 
 		default:
 			log.Printf("Unsupported language: %s", task.Lang)
@@ -176,7 +176,7 @@ func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, co
 		log.Fatalf("Error starting container exec: %s", err)
 	}
 
-	readLogs(response, ctx, redisClient, task.ID)
+	readLogs(response, ctx, redisClient, task.ID, dockerClient, execID)
 
 	os.Remove("executions/" + filename)
 	if task.Lang == "java" {
@@ -186,7 +186,7 @@ func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, co
 	}
 }
 
-func readLogs(response types.HijackedResponse, ctx context.Context, redisClient *redis.Client, submissionID string) {
+func readLogs(response types.HijackedResponse, ctx context.Context, redisClient *redis.Client, submissionID string, dockerClient *client.Client, execID string) {
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 
@@ -197,6 +197,18 @@ func readLogs(response types.HijackedResponse, ctx context.Context, redisClient 
 
 	stdout := stdoutBuf.String()
 	stderr := stderrBuf.String()
+
+	inspectResp, err := dockerClient.ContainerExecInspect(ctx, execID)
+	if err != nil {
+		log.Fatalf("Error inspecting exec: %s", err)
+	}
+
+	if inspectResp.ExitCode == 124 || inspectResp.ExitCode == 143 {
+		publishToRedis(ctx, redisClient, submissionID, "Time Limit Exceeded")
+		return
+	}
+
+	fmt.Println("Exit Code: ", inspectResp.ExitCode)
 
 	if stderr != "" {
 		log.Printf("Stderr: %s", stderr)
