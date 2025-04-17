@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,11 +9,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
-
-	"bytes"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/google/uuid"
@@ -50,21 +51,7 @@ func main() {
 	processSubmission(ctx, redisClient, dockerClient)
 }
 
-func initDockerClient() (*client.Client, error) {
-	return client.NewClientWithOpts(client.WithAPIVersionNegotiation(), client.WithHost(os.Getenv("DOCKER_HOST")))
-}
-
-func initRedisClient() *redis.Client {
-	return redis.NewClient(&redis.Options{
-		Addr:     os.Getenv("REDIS_HOST_ADDRESS"),
-		Password: "",
-		DB:       0,
-		Protocol: 2,
-	})
-}
-
 func processSubmission(ctx context.Context, redisClient *redis.Client, dockerClient *client.Client) {
-	containerID := "9b8169c7a399"
 	for {
 		submission := redisClient.BRPop(ctx, 0, "submissions")
 		result, err := submission.Result()
@@ -116,28 +103,25 @@ func processSubmission(ctx context.Context, redisClient *redis.Client, dockerCli
 
 		fmt.Printf("Processing task - Language: %s\nCode: %s\n", task.Lang, task.Code)
 
-		var command []string
+		command := getRunCommand(task.Lang, filename)
 
-		switch task.Lang {
-		case "py":
-			command = []string{"sh", "-c", fmt.Sprintf("timeout 5s python3 /executions/%s", filename)}
+		compute, err := dockerClient.ContainerCreate(ctx, &container.Config{
+			Image: getDockerImage(task.Lang),
+		}, &container.HostConfig{
+			Mounts: []mount.Mount{
+				{
+					Type:   mount.TypeBind,
+					Source: os.Getenv("SOURCE_MOUNT"),
+					Target: os.Getenv("DESTINATION_MOUNT"),
+				},
+			},
+		}, nil, nil, "")
 
-		case "java":
-			className := strings.Split(filename, ".")[0]
-			command = []string{"sh", "-c", fmt.Sprintf("javac /executions/%s && timeout 5s java -cp /executions %s", filename, className)}
-
-		case "cpp":
-			outFile := "/executions/" + strings.Split(filename, ".")[0]
-			command = []string{"sh", "-c", fmt.Sprintf("g++ /executions/%s -o %s && timeout 5s %s", filename, outFile, outFile)}
-
-		case "c":
-			outFile := "/executions/" + strings.Split(filename, ".")[0]
-			command = []string{"sh", "-c", fmt.Sprintf("gcc /executions/%s -o %s && timeout 5s %s", filename, outFile, outFile)}
-
-		default:
-			log.Printf("Unsupported language: %s", task.Lang)
-			return
+		if err != nil {
+			log.Fatalf("Error creating container: %s", err)
 		}
+
+		containerID := compute.ID
 
 		executeTaskInContainer(ctx, dockerClient, command, redisClient, containerID, task, filename)
 	}
@@ -171,22 +155,51 @@ func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, co
 	}
 	defer response.Close()
 
+	startTime := time.Now()
+	timeout := 10 * time.Second
+
 	err = dockerClient.ContainerExecStart(ctx, execID, container.ExecStartOptions{})
 	if err != nil {
 		log.Fatalf("Error starting container exec: %s", err)
 	}
 
-	readLogs(response, ctx, redisClient, task.ID, dockerClient, execID)
+	for {
+		inspect, err := dockerClient.ContainerExecInspect(ctx, execID)
+		if err != nil {
+			log.Fatalf("Error inspecting exec: %s", err)
+			break
+		}
 
-	os.Remove("executions/" + filename)
-	if task.Lang == "java" {
-		os.Remove("executions/" + strings.Split(filename, ".")[0] + ".class")
-	} else if task.Lang == "cpp" || task.Lang == "c" {
-		os.Remove("executions/" + strings.Split(filename, ".")[0])
+		if !inspect.Running {
+			break
+		}
+
+		if time.Since(startTime) > timeout {
+			log.Println("Execution timed out")
+
+			publishToRedis(ctx, redisClient, task.ID, "Time Limit Exceeded")
+
+			if err := dockerClient.ContainerKill(ctx, containerID, "SIGKILL"); err != nil {
+				log.Printf("Failed to kill container: %v", err)
+			}
+
+			removeUserFiles(filename, task)
+			cleanupContainer(ctx, dockerClient, containerID)
+
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	readLogs(response, ctx, redisClient, task.ID)
+
+	removeUserFiles(filename, task)
+
+	cleanupContainer(ctx, dockerClient, containerID)
 }
 
-func readLogs(response types.HijackedResponse, ctx context.Context, redisClient *redis.Client, submissionID string, dockerClient *client.Client, execID string) {
+func readLogs(response types.HijackedResponse, ctx context.Context, redisClient *redis.Client, submissionID string) {
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 
@@ -198,18 +211,6 @@ func readLogs(response types.HijackedResponse, ctx context.Context, redisClient 
 	stdout := stdoutBuf.String()
 	stderr := stderrBuf.String()
 
-	inspectResp, err := dockerClient.ContainerExecInspect(ctx, execID)
-	if err != nil {
-		log.Fatalf("Error inspecting exec: %s", err)
-	}
-
-	if inspectResp.ExitCode == 124 || inspectResp.ExitCode == 143 {
-		publishToRedis(ctx, redisClient, submissionID, "Time Limit Exceeded")
-		return
-	}
-
-	fmt.Println("Exit Code: ", inspectResp.ExitCode)
-
 	if stderr != "" {
 		log.Printf("Stderr: %s", stderr)
 		publishToRedis(ctx, redisClient, submissionID, stderr)
@@ -220,12 +221,7 @@ func readLogs(response types.HijackedResponse, ctx context.Context, redisClient 
 	fmt.Println("Execution completed successfully!")
 
 	publishToRedis(ctx, redisClient, submissionID, stdout)
-}
 
-func publishToRedis(ctx context.Context, redisClient *redis.Client, submissionID string, output string) {
-	redisClient.Publish(ctx, submissionID, output)
-	fmt.Println(output)
-	fmt.Printf("Successfully published on %s\n", submissionID)
 }
 
 func server() {
@@ -252,7 +248,6 @@ func server() {
 		for _, container := range containers {
 			fmt.Fprintf(w, "Container ID: %s, Image: %s, Names: %v\n", container.ID, container.Image, container.Names)
 		}
-		defer cli.Close()
 	})
 
 	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
