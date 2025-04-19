@@ -118,7 +118,8 @@ func processSubmission(ctx context.Context, redisClient *redis.Client, dockerCli
 		}, nil, nil, "")
 
 		if err != nil {
-			log.Fatalf("Error creating container: %s", err)
+			log.Printf("Error creating container: %s", err)
+			return
 		}
 
 		containerID := compute.ID
@@ -129,73 +130,75 @@ func processSubmission(ctx context.Context, redisClient *redis.Client, dockerCli
 
 func executeTaskInContainer(ctx context.Context, dockerClient *client.Client, command []string, redisClient *redis.Client, containerID string, task Task, filename string) {
 
-	err := dockerClient.ContainerStart(ctx, containerID, container.StartOptions{})
+	execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	err := dockerClient.ContainerStart(execCtx, containerID, container.StartOptions{})
 	if err != nil {
-		log.Fatalf("Error starting container %s: %v", containerID, err)
+		log.Printf("Error starting container %s: %v", containerID, err)
 		return
 	}
 
-	exec, err := dockerClient.ContainerExecCreate(ctx, containerID, container.ExecOptions{
+	exec, err := dockerClient.ContainerExecCreate(execCtx, containerID, container.ExecOptions{
 		Cmd:          command,
 		AttachStdout: true,
 		AttachStderr: true,
 	})
 
 	if err != nil {
-		log.Fatalf("Error creating exec: %s", err)
+		log.Printf("Error creating exec: %s", err)
+		return
 	}
 
 	execID := exec.ID
 
-	response, err := dockerClient.ContainerExecAttach(ctx, execID, container.ExecAttachOptions{
+	response, err := dockerClient.ContainerExecAttach(execCtx, execID, container.ExecAttachOptions{
 		Tty: false,
 	})
 	if err != nil {
-		log.Fatalf("Error attaching exec to container: %s", err)
+		log.Printf("Error attaching exec to container: %s", err)
+		return
 	}
 	defer response.Close()
 
-	startTime := time.Now()
-	timeout := 10 * time.Second
-
-	err = dockerClient.ContainerExecStart(ctx, execID, container.ExecStartOptions{})
+	err = dockerClient.ContainerExecStart(execCtx, execID, container.ExecStartOptions{})
 	if err != nil {
-		log.Fatalf("Error starting container exec: %s", err)
+		log.Printf("Error starting container exec: %s", err)
+		return
 	}
 
-	for {
-		inspect, err := dockerClient.ContainerExecInspect(ctx, execID)
-		if err != nil {
-			log.Fatalf("Error inspecting exec: %s", err)
-			break
+	done := make(chan struct{})
+
+	go func() {
+		for {
+			inspect, err := dockerClient.ContainerExecInspect(ctx, execID)
+			if err != nil {
+				log.Printf("Error inspecting exec: %s", err)
+				break
+			}
+
+			if !inspect.Running {
+				break
+			}
+
+			time.Sleep(100 * time.Millisecond)
 		}
+		close(done)
+	}()
 
-		if !inspect.Running {
-			break
-		}
-
-		if time.Since(startTime) > timeout {
-			log.Println("Execution timed out")
-
+	select {
+	case <-done:
+		readLogs(response, ctx, redisClient, task.ID)
+	case <-execCtx.Done():
+		if execCtx.Err() == context.DeadlineExceeded {
 			publishToRedis(ctx, redisClient, task.ID, "Time Limit Exceeded")
-
 			if err := dockerClient.ContainerKill(ctx, containerID, "SIGKILL"); err != nil {
 				log.Printf("Failed to kill container: %v", err)
 			}
-
-			removeUserFiles(filename, task)
-			cleanupContainer(ctx, dockerClient, containerID)
-
-			return
 		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 
-	readLogs(response, ctx, redisClient, task.ID)
-
 	removeUserFiles(filename, task)
-
 	cleanupContainer(ctx, dockerClient, containerID)
 }
 
