@@ -32,7 +32,7 @@ go mod tidy
 ### 3. Configure Environment Variables
 
 ```bash
-cp .example.env .env
+cp .env.example .env
 ```
 
 Open `.env` and set the following variables:
