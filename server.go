@@ -44,6 +44,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer dockerClient.Close()
+	defer redisClient.Close()
 
 	fmt.Println("Redis Client created!")
 	fmt.Println("Docker Client created!")
